@@ -3,7 +3,7 @@ from torch import nn
 # import clip
 from typing import Dict
 import pdb
-from transformers import EncoderDecoderModel
+from transformers import EncoderDecoderModel, T5ForConditionalGeneration
 
 # To fix a bug with downloading resnet18 weights
 torch.hub._validate_not_a_forked_repo=lambda a,b,c: True
@@ -37,8 +37,7 @@ class ResNetEncoder(nn.Module):
             otherwise return final layer feature map for visual attention
         '''
         super(ResNetEncoder, self).__init__()
-        model = torch.hub.load('pytorch/vision:v0.10.0', 
-                                    name, pretrained=pretrained)
+        model = torch.hub.load('pytorch/vision:v0.10.0', name, pretrained=pretrained)
         self.return_embed = return_embed
         if self.return_embed:
             self.model = nn.Sequential(
@@ -72,12 +71,18 @@ class ResNetEncoder(nn.Module):
 # TODO: add weight init
 class RNNDecoder(nn.Module):
     def __init__(self, input_dim, num_layers, vocab_size, 
-                 teacher_force_prob=0.9, rnn_cell=nn.LSTMCell):
+                 teacher_force_prob=0.9, rnn_cell=nn.LSTMCell, 
+                 rnn_layer_dims=None):
         super(RNNDecoder, self).__init__()
         self.num_layers = num_layers
         self.is_lstm = (rnn_cell == nn.LSTMCell)
         # Can change dimensionality
-        self.rnn_cells = [rnn_cell(input_dim, input_dim) for _ in range(num_layers)]
+
+        if rnn_layer_dims is None:
+            self.rnn_cells = [rnn_cell(input_dim, input_dim) for _ in range(num_layers)]
+        else:
+            self.rnn_cells = [rnn_cell(rnn_layer_dims[i], rnn_layer_dims[i+1])
+                              for i in range(len(rnn_layer_dims)-1)]
         
         self.embedding = nn.Embedding(vocab_size, input_dim)
         self.pred_linear = nn.Linear(input_dim, vocab_size)
@@ -85,7 +90,7 @@ class RNNDecoder(nn.Module):
         self.embedding.weight = self.pred_linear.weight
 
         self.teacher_force_prob = teacher_force_prob
-        self.max_len = 300
+        self.max_len = 30
 
     def forward(self, x, y=None):
         '''
@@ -150,7 +155,8 @@ class RNNAttentionDecoder(RNNDecoder):
     def __init__(self, input_dim, num_layers, vocab_size, teacher_force_prob=0.9, 
                  rnn_cell=nn.LSTMCell, key_dim=256):
         super(RNNAttentionDecoder, self).__init__(input_dim, num_layers, 
-            vocab_size, teacher_force_prob, rnn_cell)
+            vocab_size, teacher_force_prob, rnn_cell, 
+            rnn_layer_dims=[input_dim + key_dim] + [input_dim] * num_layers)
         
         self.attention = Attention()
         self.key_dim = key_dim
@@ -207,22 +213,44 @@ class RNNAttentionDecoder(RNNDecoder):
 
         return torch.cat(predictions, dim=1)
 
-class MyTransformer(EncoderDecoderModel):
-    def forward(self, input_ids, decoder_ids, attention_mask):
-        pass
+class T5Decoder(T5ForConditionalGeneration):
+    def forward(self, x, y=None):
+        if y is None:
+            # Assume all elements in batch have same sequence length
+            attention_mask = torch.ones(x.shape[:2])
+            # Provide dummy input_ids since we're providing inputs_embeds instead
+            return self.generate(
+                input_ids=attention_mask, inputs_embeds=x, 
+                attention_mask=attention_mask, continuous_prompt=True
+            )
+        decoder_input_ids = y[:, :-1]
+        labels = y[:, 1:]
+        out = super(T5Decoder, self).forward(
+            inputs_embeds=x, decoder_input_ids=decoder_input_ids, labels=labels
+        )
+        self.max_len = 30
+        return out.logits, out.loss
+
 
 if __name__ == '__main__':
-    # Sanity check
-    encoder = ResNetEncoder('resnet18', return_embed=True)
-    decoder = RNNDecoder(512, 2, 10000, rnn_cell=nn.GRUCell)
-    model = EncoderDecoder(encoder, decoder)
+    # # Sanity check
+    # encoder = ResNetEncoder('resnet18', return_embed=True)
+    # decoder = RNNDecoder(512, 2, 10000, rnn_cell=nn.GRUCell)
+    # model = EncoderDecoder(encoder, decoder)
 
-    # batch size 5, 3 input channels, 256x256 image
+    # # batch size 5, 3 input channels, 256x256 image
     x = torch.rand(5, 3, 256, 256)
-    y_pred = model(x)
-    # enc = encoder(x)
+    # y_pred = model(x)
+    # # enc = encoder(x)
 
     attn_encoder = ResNetEncoder('resnet18', return_embed=False)
-    attn_decoder = RNNAttentionDecoder(512, 2, 10000, rnn_cell=nn.GRUCell)
-    attn_model = EncoderDecoder(encoder, decoder)
-    y2 = attn_model(x)
+    # attn_decoder = RNNAttentionDecoder(512, 2, 10000, rnn_cell=nn.GRUCell)
+    # attn_model = EncoderDecoder(attn_encoder, attn_decoder)
+    # y2 = attn_model(x)
+
+    # model = EncoderDecoderModel.from_encoder_decoder_pretrained(
+    #     'google/vit-base-patch16-224-in21k', 'openai-gpt'
+    # )
+
+    t5 = T5Decoder.from_pretrained('t5-small')
+    model = EncoderDecoder(attn_encoder, t5)
