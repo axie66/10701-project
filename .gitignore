@@ -1,4 +1,7 @@
-*__pycache__
+*/__pycache__/*
 *.ipynb_checkpoints
 */coco/*
 coco/*
+src/plots/*
+src/utils/__pycache__/*
+src/vocab/__pycache__/*
